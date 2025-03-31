@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "amqplib": "^0.10.5",
+    "dotenv": "^16.4.7",
+    "pg": "^8.14.1",
+    "web-push": "^3.6.7"
+  }
+}
