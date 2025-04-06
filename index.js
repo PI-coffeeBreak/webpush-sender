@@ -55,7 +55,13 @@ async function consumeMessages() {
   try {
     const connection = await amqp.connect(amqpUrl);
     const channel = await connection.createChannel();
-    await channel.assertQueue(queue, { durable: true });
+    await channel.assertQueue(queue, {
+      durable: true,
+      arguments: {
+        "x-max-priority": 10,
+        "x-message-ttl": 24 * 60 * 60 * 1000,
+      },
+    });
 
     console.log(`Waiting for messages in ${queue}. To exit press CTRL+C`);
 
