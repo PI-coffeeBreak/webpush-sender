@@ -44,8 +44,23 @@ async function fetchUserSubscription(userId) {
 
 async function sendWebPush(subscription, message) {
   try {
-    await webPush.sendNotification(subscription, JSON.stringify(message));
-    console.log("Notification sent successfully");
+    // Handle the notification payload based on the message type and payload
+    const notificationPayload = {
+      notification: {
+        title: message.type || "Notification",
+        body:
+          typeof message.payload === "string"
+            ? message.payload
+            : message.payload.message,
+        data: message,
+      },
+    };
+
+    await webPush.sendNotification(
+      subscription,
+      JSON.stringify(notificationPayload)
+    );
+    console.log("Notification sent successfully:", message);
   } catch (error) {
     console.error("Error sending notification:", error);
   }
@@ -68,14 +83,14 @@ async function consumeMessages() {
     channel.consume(queue, async (msg) => {
       if (msg !== null) {
         const message = JSON.parse(msg.content.toString());
-        console.log(message);
+        console.log("Received message:", message);
 
-        const { recipient, payload } = message;
+        const { recipient, type, payload } = message;
 
         const subscription = await fetchUserSubscription(recipient);
 
         if (subscription) {
-          await sendWebPush(subscription, payload);
+          await sendWebPush(subscription, message);
         } else {
           console.log(`No subscription found for userId: ${recipient}`);
         }
