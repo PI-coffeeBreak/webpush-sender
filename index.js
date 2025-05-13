@@ -101,9 +101,27 @@ async function sendWebPush(subscriptionData, message) {
   }
 
   try {
+    console.log("Message content:", message);
+    console.log("Message type:", typeof message);
+    console.log(
+      "Processed message:",
+      typeof message == "string" ? message : message.content || message.body
+    );
+    const notificationPayload = {
+      title: "New Notification",
+      body:
+        typeof message == "string"
+          ? message
+          : message.content || message.body || "You have a new notification!",
+      icon: "/icon.png",
+      data: { message, timestamp: new Date().toISOString() },
+    };
+
+    console.log("Sending notification payload:", notificationPayload);
+
     await webPush.sendNotification(
       subscriptionData.subscription,
-      JSON.stringify(message)
+      JSON.stringify(notificationPayload)
     );
     console.log(
       `Notification sent successfully to subscription ${subscriptionData.id}`
@@ -120,6 +138,7 @@ async function sendWebPush(subscriptionData, message) {
         `VAPID authentication error for subscription ${subscriptionData.id}:`,
         error.body
       );
+      
     } else {
       console.error(
         `Error sending notification to subscription ${subscriptionData.id}:`,
