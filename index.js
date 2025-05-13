@@ -3,10 +3,20 @@ const webPush = require("web-push");
 const { Client } = require("pg");
 require("dotenv").config();
 
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+
+if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+  console.error("VAPID keys are not set in environment variables");
+  process.exit(1);
+}
+
+console.log("VAPID Public Key:", VAPID_PUBLIC_KEY);
+
 webPush.setVapidDetails(
   "mailto:example@yourdomain.com",
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
+  VAPID_PUBLIC_KEY,
+  VAPID_PRIVATE_KEY
 );
 
 const queue = "webpush_queue";
@@ -22,47 +32,120 @@ const client = new Client({
 
 client.connect().catch((error) => {
   console.error("Failed to connect to PostgreSQL:", error.message);
-  process.exit(1); // Exit the process if the database connection fails
+  process.exit(1);
 });
+
+function isValidSubscription(subscription) {
+  return (
+    subscription &&
+    typeof subscription === "object" &&
+    typeof subscription.endpoint === "string" &&
+    subscription.endpoint.length > 0 &&
+    subscription.keys &&
+    typeof subscription.keys === "object" &&
+    typeof subscription.keys.p256dh === "string" &&
+    typeof subscription.keys.auth === "string"
+  );
+}
 
 async function fetchUserSubscription(userId) {
   try {
     const res = await client.query(
-      "SELECT subscription FROM webpush_notifications_subscriptions WHERE user_id = $1",
+      "SELECT id, subscription FROM webpush_notifications_subscriptions WHERE user_id = $1",
       [userId]
     );
-    if (res.rows.length > 0) {
-      return res.rows[0].subscription;
-    } else {
-      return null;
+    if (res.rows.length > 0 && isValidSubscription(res.rows[0].subscription)) {
+      return res.rows[0];
     }
+    return null;
   } catch (error) {
     console.error("Error fetching subscription from database:", error);
     return null;
   }
 }
 
-async function sendWebPush(subscription, message) {
+async function fetchAllSubscriptions() {
   try {
-    // Handle the notification payload based on the message type and payload
+    const res = await client.query(
+      "SELECT id, subscription FROM webpush_notifications_subscriptions"
+    );
+    // Filtrar apenas subscrições válidas
+    return res.rows.filter((row) => isValidSubscription(row.subscription));
+  } catch (error) {
+    console.error("Error fetching all subscriptions from database:", error);
+    return [];
+  }
+}
+
+async function deleteSubscription(subscriptionId) {
+  try {
+    await client.query(
+      "DELETE FROM webpush_notifications_subscriptions WHERE id = $1",
+      [subscriptionId]
+    );
+    console.log(`Subscription ${subscriptionId} deleted successfully`);
+    return true;
+  } catch (error) {
+    console.error(`Error deleting subscription ${subscriptionId}:`, error);
+    return false;
+  }
+}
+
+async function sendWebPush(subscriptionData, message) {
+  if (!isValidSubscription(subscriptionData.subscription)) {
+    console.log(
+      `Invalid subscription format for ID ${subscriptionData.id}, deleting...`
+    );
+    await deleteSubscription(subscriptionData.id);
+    return false;
+  }
+
+  try {
+    console.log("Message content:", message);
+    console.log("Message type:", typeof message);
+    console.log(
+      "Processed message:",
+      typeof message == "string" ? message : message.content || message.body
+    );
     const notificationPayload = {
-      notification: {
-        title: message.type || "Notification",
-        body:
-          typeof message.payload === "string"
-            ? message.payload
-            : message.payload.message,
-        data: message,
-      },
+      title: "New Notification",
+      body:
+        typeof message == "string"
+          ? message
+          : message.content || message.body || "You have a new notification!",
+      icon: "/icon.png",
+      data: { message, timestamp: new Date().toISOString() },
     };
 
+    console.log("Sending notification payload:", notificationPayload);
+
     await webPush.sendNotification(
-      subscription,
+      subscriptionData.subscription,
       JSON.stringify(notificationPayload)
     );
-    console.log("Notification sent successfully:", message);
+    console.log(
+      `Notification sent successfully to subscription ${subscriptionData.id}`
+    );
+    return true;
   } catch (error) {
-    console.error("Error sending notification:", error);
+    if (error.statusCode === 410 || error.statusCode === 404) {
+      console.log(
+        `Subscription ${subscriptionData.id} has expired or been unsubscribed`
+      );
+      await deleteSubscription(subscriptionData.id);
+    } else if (error.statusCode === 401) {
+      console.error(
+        `VAPID authentication error for subscription ${subscriptionData.id}:`,
+        error.body
+      );
+      
+    } else {
+      console.error(
+        `Error sending notification to subscription ${subscriptionData.id}:`,
+        error
+      );
+    }
+    return false;
   }
 }
 
@@ -85,14 +168,42 @@ async function consumeMessages() {
         const message = JSON.parse(msg.content.toString());
         console.log("Received message:", message);
 
-        const { recipient, type, payload } = message;
+        const { recipient, payload, type } = message;
 
-        const subscription = await fetchUserSubscription(recipient);
+        if (recipient === null) {
+          // Handle BROADCAST messages
+          console.log("Processing BROADCAST message");
+          const subscriptions = await fetchAllSubscriptions();
+          console.log(`Sending to ${subscriptions.length} subscribers`);
 
-        if (subscription) {
-          await sendWebPush(subscription, message);
+          const results = await Promise.allSettled(
+            subscriptions.map((subscription) =>
+              sendWebPush(subscription, payload)
+            )
+          );
+
+          const successCount = results.filter(
+            (result) => result.status === "fulfilled" && result.value === true
+          ).length;
+
+          console.log(
+            `Successfully sent to ${successCount}/${subscriptions.length} subscribers`
+          );
         } else {
-          console.log(`No subscription found for userId: ${recipient}`);
+          // Handle UNICAST messages
+          console.log(`Processing UNICAST message for recipient: ${recipient}`);
+          const subscription = await fetchUserSubscription(recipient);
+
+          if (subscription) {
+            const success = await sendWebPush(subscription, payload);
+            if (!success) {
+              console.log(
+                `Failed to send notification to recipient: ${recipient}`
+              );
+            }
+          } else {
+            console.log(`No valid subscription found for userId: ${recipient}`);
+          }
         }
 
         channel.ack(msg);
