@@ -19,6 +19,11 @@ webPush.setVapidDetails(
   VAPID_PRIVATE_KEY
 );
 
+// Global variables for graceful shutdown
+let connection = null;
+let channel = null;
+let isShuttingDown = false;
+
 const queue = "webpush_queue";
 const amqpUrl = process.env.RABBITMQ_URL || "amqp://mq:5672";
 
@@ -33,6 +38,51 @@ const client = new Client({
 client.connect().catch((error) => {
   console.error("Failed to connect to PostgreSQL:", error.message);
   process.exit(1);
+});
+
+// Graceful shutdown function
+async function gracefulShutdown(signal) {
+  console.log(`Received ${signal}. Starting graceful shutdown...`);
+  isShuttingDown = true;
+
+  try {
+    // Close RabbitMQ channel and connection
+    if (channel) {
+      console.log("Closing RabbitMQ channel...");
+      await channel.close();
+    }
+    if (connection) {
+      console.log("Closing RabbitMQ connection...");
+      await connection.close();
+    }
+
+    // Close PostgreSQL connection
+    if (client) {
+      console.log("Closing PostgreSQL connection...");
+      await client.end();
+    }
+
+    console.log("Graceful shutdown completed");
+    process.exit(0);
+  } catch (error) {
+    console.error("Error during graceful shutdown:", error);
+    process.exit(1);
+  }
+}
+
+// Handle shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('unhandledRejection');
 });
 
 function isValidSubscription(subscription) {
@@ -151,8 +201,16 @@ async function sendWebPush(subscriptionData, message) {
 
 async function consumeMessages() {
   try {
-    const connection = await amqp.connect(amqpUrl);
-    const channel = await connection.createChannel();
+    connection = await amqp.connect(amqpUrl);
+    channel = await connection.createChannel();
+    
+    // Enable graceful shutdown on connection close
+    connection.on('close', () => {
+      if (!isShuttingDown) {
+        console.log('RabbitMQ connection closed unexpectedly');
+      }
+    });
+
     await channel.assertQueue(queue, {
       durable: true,
       arguments: {
@@ -164,7 +222,7 @@ async function consumeMessages() {
     console.log(`Waiting for messages in ${queue}. To exit press CTRL+C`);
 
     channel.consume(queue, async (msg) => {
-      if (msg !== null) {
+      if (msg !== null && !isShuttingDown) {
         const message = JSON.parse(msg.content.toString());
         console.log("Received message:", message);
 
@@ -206,11 +264,20 @@ async function consumeMessages() {
           }
         }
 
-        channel.ack(msg);
+        if (!isShuttingDown) {
+          channel.ack(msg);
+        }
+      } else if (isShuttingDown && msg !== null) {
+        // During shutdown, reject messages without requeue
+        channel.nack(msg, false, false);
       }
     });
   } catch (error) {
     console.error("Error in RabbitMQ consumer:", error);
+    if (!isShuttingDown) {
+      // Retry connection after delay only if not shutting down
+      setTimeout(consumeMessages, 5000);
+    }
   }
 }
 
